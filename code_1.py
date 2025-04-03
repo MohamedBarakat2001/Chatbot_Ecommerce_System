@@ -28,6 +28,10 @@ SYNONYMS_NO  = {"no", "n", "nah", "nope", "cancel"}
 
 # --- Helper Functions ---
 
+def normalize_text(text):
+    """Return a normalized version of text (lowercase, alphanumeric only)."""
+    return re.sub(r'[\W_]+', '', text.lower())
+
 def get_input(prompt):
     value = input(prompt)
     if value.strip().lower() == "exit":
@@ -71,9 +75,9 @@ def get_product_categories():
     if not conn:
         return []
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute("SELECT DISTINCT category FROM products")
-        categories = [row[0] for row in cursor.fetchall()]
+        categories = [row["category"] for row in cursor.fetchall()]
         return categories
     except Error as e:
         logging.error("Error fetching categories: %s", e)
@@ -84,16 +88,17 @@ def get_product_categories():
 
 def get_distinct_values_for_category(column_name, category):
     """
-    Return distinct values for a given column (color, size, style) from products where category matches.
+    Return distinct values for a given column (color, size, style)
+    from products where category matches.
     """
     conn = get_db_connection()
     if not conn:
         return []
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True, buffered=True)
         query = f"SELECT DISTINCT {column_name} FROM products WHERE category = %s"
         cursor.execute(query, (category,))
-        values = [row[0] for row in cursor.fetchall()]
+        values = [row[column_name] for row in cursor.fetchall()]
         return values
     except Error as e:
         logging.error(f"Error fetching {column_name} for {category}: %s", e)
@@ -146,14 +151,15 @@ def prompt_for_attribute(attribute_name, options):
 def search_product(product_name):
     """
     Search for a product by name in products.
-    Returns the product dict if found; if not found returns {"result": "Product not found"};
-    if found but stock is 0, returns {"result": "Product sold out"}.
+    Returns the product dict if found; if not, returns {"result": "Product not found"}.
+    If found but stock is 0, returns {"result": "Product sold out"}.
+    Uses SQL LIKE first, then a fallback normalized check.
     """
     conn = get_db_connection()
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(dictionary=True, buffered=True)
         query = "SELECT * FROM products WHERE LOWER(name) LIKE %s"
         cursor.execute(query, ("%" + product_name.lower() + "%",))
         product = cursor.fetchone()
@@ -161,8 +167,15 @@ def search_product(product_name):
             if product.get("quantity", 0) <= 0:
                 return {"result": "Product sold out"}
             return product
-        else:
-            return {"result": "Product not found"}
+        # Fallback: iterate over all products using normalized matching
+        cursor.execute("SELECT * FROM products", ())
+        products = cursor.fetchall()
+        norm_query = normalize_text(product_name)
+        for prod in products:
+            if norm_query in normalize_text(prod["name"]):
+                if prod.get("quantity", 0) > 0:
+                    return prod
+        return {"result": "Product not found"}
     except Error as e:
         logging.error("Error in search_product: %s", e)
         return {"error": "Error searching product"}
@@ -173,17 +186,15 @@ def search_product(product_name):
 def search_product_by_attributes(category, color, size, style):
     """
     Search for a product matching the given category, color, size, and style exactly.
-    If an exact match is not found, perform a fallback search:
-      - Retrieve all products in the category with the confirmed style.
-      - Score them based on whether color and size exactly match (0 for match, 1 for mismatch).
-      - Return the product with the lowest score.
+    If not found, perform a fallback search for products with matching category and style,
+    then score based on color and size differences.
     Returns the best candidate product or {"result": "Product not found"}.
     """
     conn = get_db_connection()
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(dictionary=True, buffered=True)
         query = """
             SELECT * FROM products
             WHERE category = %s AND LOWER(color) = %s AND LOWER(size) = %s AND LOWER(style) = %s
@@ -222,7 +233,7 @@ def suggest_alternatives_by_category(category):
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(dictionary=True, buffered=True)
         query = "SELECT * FROM products WHERE category = %s"
         cursor.execute(query, (category,))
         products = cursor.fetchall()
@@ -240,12 +251,41 @@ def format_product(product):
             f"Material: {product['material']}, Price: ${float(product['price']):.2f}, "
             f"Style: {product['style']}, Size: {product['size']}")
 
+def infer_category_from_query(query):
+    """
+    Infer a product category from the query by comparing it to product names.
+    Returns the category of the product with the highest similarity ratio if above threshold.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute("SELECT name, category FROM products")
+        products = cursor.fetchall()
+        best_ratio = 0
+        best_category = None
+        for prod in products:
+            ratio = difflib.SequenceMatcher(None, query.lower(), prod["name"].lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_category = prod["category"]
+        if best_ratio >= 0.3:
+            return best_category
+        return None
+    except Error as e:
+        logging.error("Error in infer_category_from_query: %s", e)
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
 def get_order_status(order_id):
     conn = get_db_connection()
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
         order = cursor.fetchone()
         return order if order else {"result": "Order not found"}
@@ -261,7 +301,7 @@ def cancel_order(order_id):
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
         result = cursor.fetchone()
         if not result:
@@ -282,14 +322,14 @@ def cancel_order(order_id):
 def place_order(order_details):
     """
     Insert an order into the orders table.
-    Expects columns: product_id, product_name, color, material, style, size, price, quantity,
+    Expects: product_id, product_name, color, material, style, size, price, quantity,
              shipping_address, customer_name, email, phone, payment_info, status.
     """
     conn = get_db_connection()
     if not conn:
         return {"error": "DB connection failed"}
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(buffered=True)
         query = """
             INSERT INTO orders 
             (product_id, product_name, color, material, style, size, price, quantity, 
@@ -324,10 +364,12 @@ def place_order(order_details):
 
 def determine_intent(user_input):
     lower_input = user_input.lower()
+    # If input is similar to "order" (even if misspelled), treat it as a place order request.
+    if difflib.SequenceMatcher(None, normalize_text(user_input), normalize_text("order")).ratio() >= 0.8:
+        return "place_order"
     if "cancel order" in lower_input or "cancel my order" in lower_input:
         return "cancel_order"
-    if ("order status" in lower_input or "track my order" in lower_input or 
-        "status of my order" in lower_input or "status of an order" in lower_input):
+    if "status" in lower_input:
         return "order_status"
     if ("do you have" in lower_input or ("i want" in lower_input and not re.search(r'\border\b|\bbuy\b|\bpurchase\b', lower_input))):
         return "inquire_product"
@@ -424,7 +466,7 @@ def chat():
                 response_text = "Database connection error."
             else:
                 try:
-                    cursor = conn.cursor(dictionary=True)
+                    cursor = conn.cursor(dictionary=True, buffered=True)
                     cursor.execute("SELECT * FROM products")
                     products = cursor.fetchall()
                     if products:
@@ -445,22 +487,115 @@ def chat():
             result = search_product(inquiry_query)
             if result.get("error"):
                 response_text = "There was an error checking our inventory."
+                print("Chatbot:", response_text)
+                conversation_history += "Assistant: " + response_text + "\n"
+                continue
             elif result.get("result") == "Product not found":
-                categories = get_product_categories()
-                matches = difflib.get_close_matches(inquiry_query, categories, n=1, cutoff=0.3)
-                matching_category = matches[0] if matches else None
-                if matching_category:
-                    alt_products = suggest_alternatives_by_category(matching_category)
+                available_categories = get_product_categories()
+                response_text = f"Sorry, we do not have '{inquiry_query}' available. Our available categories are: {', '.join(available_categories)}."
+                print("Chatbot:", response_text)
+                chosen_cat = get_input("Please choose one of these categories: ").strip().lower()
+                while chosen_cat not in [cat.lower() for cat in available_categories]:
+                    chosen_cat = get_input("Invalid category. Please choose from: " + ", ".join(available_categories) + ": ").strip().lower()
+                for cat in available_categories:
+                    if cat.lower() == chosen_cat:
+                        category = cat
+                        break
+                # Proceed to order process for the chosen category
+                colors = get_distinct_values_for_category("color", category)
+                if not colors:
+                    print("Chatbot: Sorry, no colors available for this category.")
+                    continue
+                color = prompt_for_attribute("color", colors)
+                if color is None:
+                    print("Chatbot: Order cancelled.")
+                    continue
+                sizes = get_distinct_values_for_category("size", category)
+                if not sizes:
+                    print("Chatbot: Sorry, no sizes available for this category.")
+                    continue
+                size = prompt_for_attribute("size", sizes)
+                if size is None:
+                    print("Chatbot: Order cancelled.")
+                    continue
+                styles = get_distinct_values_for_category("style", category)
+                if not styles:
+                    print("Chatbot: Sorry, no styles available for this category.")
+                    continue
+                style = prompt_for_attribute("style", styles)
+                if style is None:
+                    print("Chatbot: Order cancelled.")
+                    continue
+                existing_product = search_product_by_attributes(category, color, size, style)
+                if existing_product.get("result") in ["Product not found", "Product sold out"]:
+                    alt_products = suggest_alternatives_by_category(category)
                     if isinstance(alt_products, dict) and alt_products.get("result") == "No alternatives found":
-                        response_text = f"Sorry, we do not have any '{inquiry_query}' available."
+                        response_text = f"Sorry, we do not have a product matching that configuration in '{category}', and no alternatives are available."
                     else:
                         formatted_alts = "\n".join(format_product(p) for p in alt_products)
-                        response_text = f"Sorry, we do not have '{inquiry_query}' available. However, here are alternatives in the '{matching_category}' category:\n{formatted_alts}"
+                        response_text = (f"Sorry, we do not have a product matching that configuration in '{category}'.\n"
+                                         f"Available alternatives in this category:\n{formatted_alts}")
+                    print("Chatbot:", response_text)
+                    conversation_history += "Assistant: " + response_text + "\n"
+                    continue
                 else:
-                    available_categories = get_product_categories()
-                    response_text = f"Sorry, we do not have '{inquiry_query}' available. Our available categories are: {', '.join(available_categories)}."
+                    result = existing_product  # use the found alternative
             else:
-                response_text = f"Yes, we have {format_product(result)} available."
+                print(f"Chatbot: Yes, we have {format_product(result)} available.")
+                confirm_buy = get_input("Would you like to buy this product? (yes/no): ").strip().lower()
+                if confirm_buy not in SYNONYMS_YES:
+                    print("Chatbot: Okay, inquiry cancelled.")
+                    conversation_history += "Assistant: Inquiry cancelled.\n"
+                    continue
+            # Proceed to order checkout with the found product (result)
+            quantity_input = get_input("How many would you like to order? (enter a number): ")
+            try:
+                quantity = int(quantity_input)
+            except ValueError:
+                print("Chatbot: Invalid number. Order cancelled.")
+                continue
+            if quantity > result.get("quantity", 0):
+                print(f"Chatbot: Sorry, only {result.get('quantity', 0)} unit(s) available. Order cancelled.")
+                continue
+            try:
+                total_price = float(result["price"]) * quantity
+            except (TypeError, ValueError):
+                total_price = 0.0
+            confirm_price = get_input(f"The total price for {quantity} unit(s) of '{result['name']}' is ${total_price:.2f}. Do you accept this price? (yes/no): ").strip().lower()
+            if confirm_price not in SYNONYMS_YES:
+                print("Chatbot: Order cancelled.")
+                continue
+            customer_name = get_input("Please enter your full name: ")
+            shipping_address = get_input("Please enter your address (street, city, state, zip): ")
+            email = get_email_input("Please enter your email address (for order confirmation and tracking): ")
+            phone = get_phone_input("Please enter your phone number (e.g., +201111111111): ")
+            payment_method = get_input("Please select a payment method (Visa, Mastercard, or cash): ").strip().lower()
+            while payment_method not in {"visa", "mastercard", "cash"}:
+                payment_method = get_input("Invalid payment method. Please select from Visa, Mastercard, or cash: ").strip().lower()
+            if payment_method == "cash":
+                payment_info = "cash"
+            else:
+                payment_info = get_input("Please enter your card details (card number, expiration date, CVV): ")
+            order_details = {
+                "product_id": result["id"],
+                "product_name": result["name"],
+                "color": result["color"],
+                "material": result["material"],
+                "style": result["style"],
+                "size": result["size"],
+                "price": result["price"],
+                "quantity": quantity,
+                "shipping_address": shipping_address,
+                "customer_name": customer_name,
+                "email": email,
+                "phone": phone,
+                "payment_info": payment_info
+            }
+            insert_result = place_order(order_details)
+            if insert_result.get("error"):
+                response_text = "There was an error placing your order."
+            else:
+                response_text = f"Order placed successfully with order ID: {insert_result.get('order_id')}"
         
         elif intent == "search_product":
             product_query = re.sub(r'\b(find|search|available)\b', '', user_input, flags=re.IGNORECASE).strip()
@@ -489,7 +624,6 @@ def chat():
                 if c.lower() == cat_input.strip().lower():
                     category = c
                     break
-            
             colors = get_distinct_values_for_category("color", category)
             if not colors:
                 print("Chatbot: Sorry, no colors available for this category.")
@@ -498,7 +632,6 @@ def chat():
             if color is None:
                 print("Chatbot: Order cancelled.")
                 continue
-            
             sizes = get_distinct_values_for_category("size", category)
             if not sizes:
                 print("Chatbot: Sorry, no sizes available for this category.")
@@ -507,7 +640,6 @@ def chat():
             if size is None:
                 print("Chatbot: Order cancelled.")
                 continue
-            
             styles = get_distinct_values_for_category("style", category)
             if not styles:
                 print("Chatbot: Sorry, no styles available for this category.")
@@ -516,7 +648,6 @@ def chat():
             if style is None:
                 print("Chatbot: Order cancelled.")
                 continue
-            
             existing_product = search_product_by_attributes(category, color, size, style)
             if existing_product.get("result") in ["Product not found", "Product sold out"]:
                 alt_products = suggest_alternatives_by_category(category)
@@ -532,14 +663,12 @@ def chat():
             elif existing_product.get("error"):
                 print("Chatbot: Error searching for product. Try again later.")
                 continue
-            
             product_price = existing_product["price"]
             available_stock = existing_product["quantity"]
             print(f"Chatbot: We have '{existing_product['name']}' available in {existing_product['color']}, "
                   f"material: {existing_product['material']}, style: {existing_product['style']}, size: {existing_product['size']}, "
                   f"priced at ${float(product_price):.2f}.")
             print(f"Chatbot: Available stock: {available_stock} unit(s).")
-            
             while True:
                 qty_input = get_input("How many would you like to order? (enter a number): ")
                 try:
@@ -551,25 +680,26 @@ def chat():
                     print(f"Chatbot: Sorry, only {available_stock} unit(s) are available. Please choose a quantity ≤ {available_stock}.")
                 else:
                     break
-            
             try:
                 total_price = float(product_price) * quantity
             except (TypeError, ValueError):
                 total_price = 0.0
-            
             confirm = get_input(f"The total price for {quantity} unit(s) of '{existing_product['name']}' is ${total_price:.2f}. Do you accept this price? (yes/no): ").strip().lower()
             if confirm not in SYNONYMS_YES:
-                response_text = "Order cancelled."
-                print("Chatbot:", response_text)
-                conversation_history += "Assistant: " + response_text + "\n"
+                print("Chatbot: Order cancelled.")
+                conversation_history += "Assistant: Order cancelled.\n"
                 continue
-            
             customer_name = get_input("Please enter your full name: ")
             shipping_address = get_input("Please enter your address (street, city, state, zip): ")
             email = get_email_input("Please enter your email address (for order confirmation and tracking): ")
             phone = get_phone_input("Please enter your phone number (e.g., +201111111111): ")
-            payment_info = get_input("Please enter your payment information (enter card details or type 'cash' for cash on delivery): ")
-            
+            payment_method = get_input("Please select a payment method (Visa, Mastercard, or cash): ").strip().lower()
+            while payment_method not in {"visa", "mastercard", "cash"}:
+                payment_method = get_input("Invalid payment method. Please select from Visa, Mastercard, or cash: ").strip().lower()
+            if payment_method == "cash":
+                payment_info = "cash"
+            else:
+                payment_info = get_input("Please enter your card details (card number, expiration date, CVV): ")
             order_details = {
                 "product_id": existing_product["id"],
                 "product_name": existing_product["name"],
