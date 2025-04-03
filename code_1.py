@@ -29,8 +29,18 @@ SYNONYMS_NO  = {"no", "n", "nah", "nope", "cancel"}
 # --- Helper Functions ---
 
 def normalize_text(text):
-    """Return a normalized version of text (lowercase, alphanumeric only)."""
-    return re.sub(r'[\W_]+', '', text.lower())
+    """
+    Return a normalized version of text:
+      - Lowercase the string.
+      - Remove all non-alphanumeric characters.
+      - Reduce any sequence of more than two repeated characters to exactly two.
+    This ensures that variations such as 'tshirt', 't shirt', and 'Tshirt' or 
+    'hoodie', 'Hooooodie', and 'Hoodie' become identical.
+    """
+    text = text.lower()
+    text = re.sub(r'[\W_]+', '', text)
+    text = re.sub(r'(.)\1{2,}', r'\1\1', text)
+    return text
 
 def get_input(prompt):
     value = input(prompt)
@@ -153,7 +163,7 @@ def search_product(product_name):
     Search for a product by name in products.
     Returns the product dict if found; if not, returns {"result": "Product not found"}.
     If found but stock is 0, returns {"result": "Product sold out"}.
-    Uses SQL LIKE first, then a fallback normalized check.
+    Uses SQL LIKE first, then a fallback canonicalized check.
     """
     conn = get_db_connection()
     if not conn:
@@ -167,7 +177,7 @@ def search_product(product_name):
             if product.get("quantity", 0) <= 0:
                 return {"result": "Product sold out"}
             return product
-        # Fallback: iterate over all products using normalized matching
+        # Fallback: iterate over all products using canonicalized matching
         cursor.execute("SELECT * FROM products", ())
         products = cursor.fetchall()
         norm_query = normalize_text(product_name)
@@ -364,7 +374,9 @@ def place_order(order_details):
 
 def determine_intent(user_input):
     lower_input = user_input.lower()
-    # If input is similar to "order" (even if misspelled), treat it as a place order request.
+    # NEW: If the user types any variation of "suggest", treat it as a place_order request.
+    if "suggest" in lower_input:
+        return "place_order"
     if difflib.SequenceMatcher(None, normalize_text(user_input), normalize_text("order")).ratio() >= 0.8:
         return "place_order"
     if "cancel order" in lower_input or "cancel my order" in lower_input:
@@ -492,7 +504,7 @@ def chat():
                 continue
             elif result.get("result") == "Product not found":
                 available_categories = get_product_categories()
-                response_text = f"Sorry, we do not have '{inquiry_query}' available. Our available categories are: {', '.join(available_categories)}."
+                response_text = f" if you want to see if we have '{inquiry_query}' available or not, please choose its category to see our products. Our available categories are: {', '.join(available_categories)}."
                 print("Chatbot:", response_text)
                 chosen_cat = get_input("Please choose one of these categories: ").strip().lower()
                 while chosen_cat not in [cat.lower() for cat in available_categories]:
@@ -595,7 +607,7 @@ def chat():
             if insert_result.get("error"):
                 response_text = "There was an error placing your order."
             else:
-                response_text = f"Order placed successfully with order ID: {insert_result.get('order_id')}"
+                response_text = f"Order placed successfully with order ID(save it to check the status of your order later): {insert_result.get('order_id')}"
         
         elif intent == "search_product":
             product_query = re.sub(r'\b(find|search|available)\b', '', user_input, flags=re.IGNORECASE).strip()
@@ -612,6 +624,7 @@ def chat():
         elif intent == "add_to_cart":
             response_text = "We currently support placing orders directly, not a cart-based flow. Please use 'order' or 'buy'."
         
+        # NEW: The "suggest" command now triggers "place_order", so this branch handles the entire order process.
         elif intent == "place_order":
             available_categories = get_product_categories()
             if not available_categories:
