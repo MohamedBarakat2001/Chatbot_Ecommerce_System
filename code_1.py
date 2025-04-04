@@ -504,7 +504,7 @@ def chat():
                 continue
             elif result.get("result") == "Product not found":
                 available_categories = get_product_categories()
-                response_text = f" if you want to see if we have '{inquiry_query}' available or not, please choose its category to see our products. Our available categories are: {', '.join(available_categories)}."
+                response_text = f" if you want to see if we have '{inquiry_query}' available or not, please choose its category to see our products. Our available categories are: {', '.join(available_categories)} please enter the name of the category as it's shown."
                 print("Chatbot:", response_text)
                 chosen_cat = get_input("Please choose one of these categories: ").strip().lower()
                 while chosen_cat not in [cat.lower() for cat in available_categories]:
